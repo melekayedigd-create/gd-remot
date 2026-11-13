@@ -1,0 +1,11 @@
+{
+	"geode": "5.0.0",
+	"gd": {
+		"android": "2.2081"
+	},
+	"id": "myriam.pc-remote",
+	"name": "PC Remote",
+	"version": "v2.0.0",
+	"developer": "Myriam",
+	"description": "See and control Geometry Dash on your tablet from a PC browser over Wi-Fi (screen, touch, keyboard, editor)"
+}
