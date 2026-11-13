@@ -196,7 +196,8 @@ static std::vector<std::string> localIPs() {
 struct Client {
     int fd;
     std::mutex sendMtx;
-    std::atomic<bool> readyForFrame{true};
+    static constexpr int MAX_IN_FLIGHT = 2;
+    std::atomic<int> credits{MAX_IN_FLIGHT}; // frames we may send before the PC acks
     bool sendText(std::string const& s) {
         std::lock_guard lock(sendMtx);
         return wsSend(fd, 0x1, s.data(), s.size());
@@ -212,7 +213,7 @@ static std::vector<std::shared_ptr<Client>> g_clients;
 
 static bool anyClientReady() {
     std::lock_guard lock(g_clientsMtx);
-    for (auto& c : g_clients) if (c->readyForFrame) return true;
+    for (auto& c : g_clients) if (c->credits > 0) return true;
     return false;
 }
 
@@ -398,6 +399,8 @@ struct FrameJob {
     std::vector<uint8_t> rgba; // bottom-up rows, as OpenGL returns them
     int w = 0, h = 0;
     int dstW = 0, dstH = 0;    // final size (CPU path shrinks to this)
+    float captureMs = 0;       // time spent on the game thread
+    bool gpu = false;          // which capture path was used
 };
 
 static std::mutex g_jobMtx;
@@ -526,7 +529,7 @@ static void captureFrame() {
     auto now = std::chrono::steady_clock::now();
     int fps = std::clamp(g_cfgFps.load(), 1, 60);
     if (now - g_lastCapture < std::chrono::microseconds(1000000 / fps - 2000)) return;
-    if (g_encoderBusy || !anyClientReady()) return;
+    if (!anyClientReady()) return;
     {
         std::lock_guard lock(g_jobMtx);
         if (g_job) return;
@@ -547,8 +550,10 @@ static void captureFrame() {
     job->rgba.swap(g_spareBuffer);
     job->dstW = dw; job->dstH = dh;
 
+    auto t0 = std::chrono::steady_clock::now();
     if (g_gpu.capture(fw, fh, dw, dh, job->rgba)) {
         job->w = dw; job->h = dh;
+        job->gpu = true;
     } else {
         // CPU path: read the full frame, the encoder thread shrinks it
         job->rgba.resize(size_t(fw) * fh * 4);
@@ -556,6 +561,7 @@ static void captureFrame() {
         glReadPixels(0, 0, fw, fh, GL_RGBA, GL_UNSIGNED_BYTE, job->rgba.data());
         job->w = fw; job->h = fh;
     }
+    job->captureMs = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - t0).count();
     g_lastCapture = now;
 
     {
@@ -616,16 +622,50 @@ static void encoderLoop() {
             }
         }
 
+        // Encode horizontal strips on several cores at once, then send them together.
+        // Message: [u16 W][u16 H][u8 strips][u16 captureMs*10][u16 encodeMs*10][u8 flags]
+        //          then per strip: [u16 y][u16 h][u32 len][jpeg bytes]
+        auto tEnc = std::chrono::steady_clock::now();
+        int quality = std::clamp(g_cfgQuality.load(), 10, 95);
+        unsigned cores = std::max(1u, std::thread::hardware_concurrency());
+        int strips = std::clamp(int(cores) - 1, 1, 4);
+        int stripH = std::max(16, (dh / strips + 15) & ~15);
+        strips = (dh + stripH - 1) / stripH;
+        std::vector<std::string> parts(strips);
+        {
+            std::vector<std::thread> workers;
+            for (int i = 0; i < strips; i++) {
+                workers.emplace_back([&, i] {
+                    int y0 = i * stripH, h = std::min(stripH, dh - y0);
+                    stbi_write_jpg_to_func(jpegWrite, &parts[i], dw, h, 3, rgb.data() + size_t(y0) * dw * 3, quality);
+                });
+            }
+            for (auto& w : workers) w.join();
+        }
+        float encodeMs = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - tEnc).count();
+
+        auto put16 = [](std::string& o, uint32_t v) { o += char(v & 0xff); o += char((v >> 8) & 0xff); };
+        auto put32 = [&](std::string& o, uint32_t v) { put16(o, v & 0xffff); put16(o, v >> 16); };
         jpeg.clear();
-        stbi_write_jpg_to_func(jpegWrite, &jpeg, dw, dh, 3, rgb.data(), std::clamp(g_cfgQuality.load(), 10, 95));
+        put16(jpeg, dw); put16(jpeg, dh);
+        jpeg += char(strips);
+        put16(jpeg, uint32_t(std::min(6500.f, job->captureMs) * 10));
+        put16(jpeg, uint32_t(std::min(6500.f, encodeMs) * 10));
+        jpeg += char(job->gpu ? 1 : 0);
+        for (int i = 0; i < strips; i++) {
+            put16(jpeg, i * stripH);
+            put16(jpeg, std::min(stripH, dh - i * stripH));
+            put32(jpeg, uint32_t(parts[i].size()));
+            jpeg += parts[i];
+        }
 
         std::vector<std::shared_ptr<Client>> targets;
         {
             std::lock_guard lock(g_clientsMtx);
-            for (auto& c : g_clients) if (c->readyForFrame) targets.push_back(c);
+            for (auto& c : g_clients) if (c->credits > 0) targets.push_back(c);
         }
         for (auto& c : targets) {
-            c->readyForFrame = false;
+            c->credits--;
             if (!c->sendBinary(jpeg)) ::shutdown(c->fd, SHUT_RDWR);
         }
 
@@ -681,7 +721,11 @@ static void runWebSocket(int fd) {
         if (opcode == 0x9) { std::lock_guard l(client->sendMtx); wsSend(fd, 0xA, payload.data(), payload.size()); continue; }
         if (opcode != 0x1) continue;
 
-        if (payload == "ack") { client->readyForFrame = true; continue; }
+        if (payload == "ack") {
+            int c = client->credits.load();
+            while (c < Client::MAX_IN_FLIGHT && !client->credits.compare_exchange_weak(c, c + 1)) {}
+            continue;
+        }
         if (payload.rfind("ping ", 0) == 0) { client->sendText("pong " + payload.substr(5)); continue; }
         if (payload.rfind("cfg ", 0) == 0) {
             std::istringstream in(payload.substr(4));
