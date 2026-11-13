@@ -20,6 +20,7 @@
 
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <time.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
@@ -211,10 +212,22 @@ static bool anyClientReady() {
 // Input injection (main thread only)
 // The `if constexpr (requires ...)` blocks adapt to small API differences between GD/Geode versions.
 // ==================================================================
+// Same clock Android uses for input events (seconds since boot, monotonic)
+static double inputTimestamp() {
+    timespec ts{};
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return double(ts.tv_sec) + double(ts.tv_nsec) / 1e9;
+}
+
 template <class View>
 static void injectTouch(View* view, char phase, int id, float x, float y) {
     if (!view) return;
-    if constexpr (requires { view->handleTouchesBegin(1, &id, &x, &y); }) {
+    double t = inputTimestamp();
+    if constexpr (requires { view->handleTouchesBegin(1, &id, &x, &y, t); }) {
+        if (phase == 'd') view->handleTouchesBegin(1, &id, &x, &y, t);
+        else if (phase == 'm') view->handleTouchesMove(1, &id, &x, &y, t);
+        else view->handleTouchesEnd(1, &id, &x, &y, t);
+    } else if constexpr (requires { view->handleTouchesBegin(1, &id, &x, &y); }) {
         if (phase == 'd') view->handleTouchesBegin(1, &id, &x, &y);
         else if (phase == 'm') view->handleTouchesMove(1, &id, &x, &y);
         else view->handleTouchesEnd(1, &id, &x, &y);
@@ -231,7 +244,7 @@ static void injectKey(Dir* dir, int code, bool down, bool repeat, int mods) {
     }
     auto key = static_cast<enumKeyCodes>(code);
     if constexpr (requires { kd->dispatchKeyboardMSG(key, down, repeat, 0.0); }) {
-        kd->dispatchKeyboardMSG(key, down, repeat, 0.0);
+        kd->dispatchKeyboardMSG(key, down, repeat, inputTimestamp());
     } else if constexpr (requires { kd->dispatchKeyboardMSG(key, down, repeat); }) {
         kd->dispatchKeyboardMSG(key, down, repeat);
     } else if constexpr (requires { kd->dispatchKeyboardMSG(key, down); }) {
