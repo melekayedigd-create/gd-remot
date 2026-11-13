@@ -30,7 +30,8 @@ jobs:
         uses: geode-sdk/build-geode-mod@main
         with:
           bindings: geode-sdk/bindings
-          bindings-ref: main
+          sdk: given
+          bindings-ref: 1605f500d053f8de122bf5c7dc6d17c24866e02e
           combine: true
           target: ${{ matrix.config.target }}
 
