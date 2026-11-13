@@ -24,7 +24,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
-#include <ifaddrs.h>
+#include <sys/ioctl.h>
 #include <net/if.h>
 #include <unistd.h>
 
@@ -167,18 +167,26 @@ static std::string headerValue(std::string const& req, std::string const& name) 
 }
 
 static std::vector<std::string> localIPs() {
+    // SIOCGIFCONF works on every Android version (getifaddrs needs Android 7+)
     std::vector<std::string> ips;
-    ifaddrs* list = nullptr;
-    if (getifaddrs(&list) != 0) return ips;
-    for (auto it = list; it; it = it->ifa_next) {
-        if (!it->ifa_addr || it->ifa_addr->sa_family != AF_INET) continue;
-        if (it->ifa_flags & IFF_LOOPBACK) continue;
-        if (!(it->ifa_flags & IFF_UP)) continue;
-        char buf[INET_ADDRSTRLEN];
-        auto sin = reinterpret_cast<sockaddr_in*>(it->ifa_addr);
-        if (inet_ntop(AF_INET, &sin->sin_addr, buf, sizeof(buf))) ips.emplace_back(buf);
+    int s = ::socket(AF_INET, SOCK_DGRAM, 0);
+    if (s < 0) return ips;
+    char buf[4096];
+    ifconf ifc{};
+    ifc.ifc_len = sizeof(buf);
+    ifc.ifc_buf = buf;
+    if (ioctl(s, SIOCGIFCONF, &ifc) == 0) {
+        for (auto* it = ifc.ifc_req; reinterpret_cast<char*>(it + 1) <= buf + ifc.ifc_len; ++it) {
+            if (it->ifr_addr.sa_family != AF_INET) continue;
+            auto sin = reinterpret_cast<sockaddr_in*>(&it->ifr_addr);
+            char ip[INET_ADDRSTRLEN];
+            if (!inet_ntop(AF_INET, &sin->sin_addr, ip, sizeof(ip))) continue;
+            std::string addr(ip);
+            if (addr.rfind("127.", 0) == 0) continue; // skip loopback
+            ips.push_back(addr);
+        }
     }
-    freeifaddrs(list);
+    ::close(s);
     return ips;
 }
 
