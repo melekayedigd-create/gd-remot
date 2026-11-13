@@ -5,7 +5,7 @@
 	},
 	"id": "myriam.pc-remote",
 	"name": "PC Remote",
-	"version": "v2.0.0",
+	"version": "v2.1.0",
 	"developer": "Myriam",
 	"description": "See and control Geometry Dash on your tablet from a PC browser over Wi-Fi (screen, touch, keyboard, editor)"
 }
