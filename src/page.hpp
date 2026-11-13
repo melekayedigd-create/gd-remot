@@ -24,11 +24,11 @@ static char const* PC_REMOTE_PAGE = R"GDPAGE(<!DOCTYPE html>
   .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--red); box-shadow: 0 0 7px var(--red); flex: none; }
   .dot.on { background: var(--green); box-shadow: 0 0 7px var(--green); }
   .dot.wait { background: var(--yellow); box-shadow: 0 0 7px var(--yellow); }
-  #status { font-size: 12px; color: var(--dim); min-width: 170px; }
+  #status { font-size: 12px; color: var(--dim); min-width: 170px; white-space: nowrap; }
   .grp { display: flex; align-items: center; gap: 5px; font-size: 12px; color: var(--dim); }
   .sp { flex: 1; }
 
-  #stage { flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; position: relative; background: #000; }
+  #stage { flex: 1; min-height: 0; overflow: hidden; display: flex; align-items: center; justify-content: center; position: relative; background: #000; }
   #screen { display: none; touch-action: none; cursor: crosshair; image-rendering: auto; outline: none; }
   #empty { color: var(--dim); text-align: center; line-height: 1.7; font-size: 14px; padding: 20px; max-width: 640px; }
   #empty b { color: var(--text); }
@@ -78,7 +78,7 @@ static char const* PC_REMOTE_PAGE = R"GDPAGE(<!DOCTYPE html>
 (() => {
   const $ = (id) => document.getElementById(id);
   const ipEl = $("ip"), portEl = $("port"), dot = $("dot"), statusEl = $("status"), connectBtn = $("connectBtn");
-  const canvas = $("screen"), ctx = canvas.getContext("2d"), empty = $("empty"), focusHint = $("focusHint");
+  const canvas = $("screen"), ctx = canvas.getContext("2d", { alpha: false, desynchronized: true }), empty = $("empty"), focusHint = $("focusHint");
   const cfgWidth = $("cfgWidth"), cfgFps = $("cfgFps"), cfgQuality = $("cfgQuality");
 
   // ---------- saved settings ----------
@@ -106,6 +106,7 @@ static char const* PC_REMOTE_PAGE = R"GDPAGE(<!DOCTYPE html>
   // ---------- connection ----------
   let ws = null, wantConnected = false, reconnectTimer = null, pingTimer = null;
   let lastPing = 0, frames = 0, bytes = 0, fpsShown = 0, kbShown = 0, hasFrame = false;
+  let capMs = 0, encMs = 0, decMs = 0, gpu = true, frameSeq = 0, drawnSeq = 0;
 
   function setStatus(state, text) {
     dot.className = "dot" + (state === "on" ? " on" : state === "wait" ? " wait" : "");
@@ -126,7 +127,7 @@ static char const* PC_REMOTE_PAGE = R"GDPAGE(<!DOCTYPE html>
     if (ws) { ws.onclose = null; ws.close(); }
     setStatus("wait", "Connecting…");
     try { ws = new WebSocket(`ws://${ip}:${port}`); } catch (e) { wantConnected = false; setStatus("off", "Bad address"); return; }
-    ws.binaryType = "blob";
+    ws.binaryType = "arraybuffer";
 
     ws.onopen = () => {
       setStatus("on", "Connected, waiting for video…");
@@ -166,21 +167,41 @@ static char const* PC_REMOTE_PAGE = R"GDPAGE(<!DOCTYPE html>
 
   function updateStats() {
     if (!isOpen()) return;
-    setStatus("on", hasFrame ? `${fpsShown} fps · ${lastPing} ms · ${kbShown} KB/s` : `Connected · ${lastPing} ms · waiting for video`);
+    setStatus("on", hasFrame
+      ? `${fpsShown} fps · Wi-Fi ${lastPing} ms · ${kbShown} KB/s · tablet ${capMs.toFixed(1)}+${encMs.toFixed(0)} ms${gpu ? "" : " (CPU)"} · PC ${decMs.toFixed(0)} ms`
+      : `Connected · ${lastPing} ms · waiting for video`);
   }
 
   // ---------- video ----------
-  async function showFrame(blob) {
-    bytes += blob.size;
+  // Frame = header + several JPEG strips (encoded in parallel on the tablet)
+  async function showFrame(buf) {
+    const seq = ++frameSeq;
+    bytes += buf.byteLength;
+    const t0 = performance.now();
     try {
-      const bmp = await createImageBitmap(blob);
-      if (canvas.width !== bmp.width || canvas.height !== bmp.height) { canvas.width = bmp.width; canvas.height = bmp.height; fitCanvas(); }
-      ctx.drawImage(bmp, 0, 0);
-      bmp.close();
-      frames++;
-      if (!hasFrame) { hasFrame = true; canvas.style.display = "block"; empty.style.display = "none"; canvas.focus(); }
+      const dv = new DataView(buf);
+      const W = dv.getUint16(0, true), H = dv.getUint16(2, true), n = dv.getUint8(4);
+      capMs = dv.getUint16(5, true) / 10; encMs = dv.getUint16(7, true) / 10; gpu = (dv.getUint8(9) & 1) === 1;
+      let off = 10;
+      const parts = [];
+      for (let i = 0; i < n; i++) {
+        const y = dv.getUint16(off, true), len = dv.getUint32(off + 4, true);
+        off += 8;
+        parts.push({ y, blob: new Blob([new Uint8Array(buf, off, len)], { type: "image/jpeg" }) });
+        off += len;
+      }
+      const bmps = await Promise.all(parts.map((p) => createImageBitmap(p.blob)));
+      if (seq > drawnSeq) {           // never draw an older frame over a newer one
+        drawnSeq = seq;
+        if (canvas.width !== W || canvas.height !== H) { canvas.width = W; canvas.height = H; fitCanvas(); }
+        bmps.forEach((b, i) => ctx.drawImage(b, 0, parts[i].y));
+        frames++;
+        decMs = decMs * 0.8 + (performance.now() - t0) * 0.2;
+        if (!hasFrame) { hasFrame = true; canvas.style.display = "block"; empty.style.display = "none"; canvas.focus(); }
+      }
+      bmps.forEach((b) => b.close());
     } catch (e) { /* bad frame, skip */ }
-    send("ack"); // ask for the next frame (keeps lag low)
+    send("ack"); // lets the tablet send another frame
   }
 
   // Scale the video to fill the window while keeping its shape
@@ -193,6 +214,7 @@ static char const* PC_REMOTE_PAGE = R"GDPAGE(<!DOCTYPE html>
     canvas.style.height = Math.floor(canvas.height * scale) + "px";
   }
   window.addEventListener("resize", fitCanvas);
+  if (window.ResizeObserver) new ResizeObserver(fitCanvas).observe(stageEl);
   document.addEventListener("fullscreenchange", () => setTimeout(fitCanvas, 50));
 
   // ---------- touches ----------
